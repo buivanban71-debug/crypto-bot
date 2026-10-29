@@ -46,16 +46,17 @@ Thiếu khóa này bot vẫn chạy, chỉ không có đoạn "🤖 Nhận đị
 4. Có dấu ✅ xanh là xong. Từ giờ bot tự chạy 15 phút/lần.
 
 ## Giai đoạn 3 – Backtest và giao dịch giấy
-Cần thêm file `backtest.py` vào kho (Add file → Create new file, giống bước 2).
+Bot theo dõi 3 coin: BTC, ETH, SOL. Muốn đổi, sửa `COINS` đầu file `bot_actions.py`.
 
-- **Backtest:** mỗi Chủ nhật 9h sáng, bot thử 3 chiến lược trên ~39 ngày giá gần nhất của từng coin
-  và gửi bảng kết quả qua Telegram: lãi/lỗ, số lệnh, tỉ lệ thắng, mức sụt giảm tối đa,
-  so với việc mua rồi giữ nguyên. Muốn chạy ngay: Actions → Run workflow → chọn `backtest`.
-- **Giao dịch giấy:** mỗi coin được cấp 200 USDT ảo. Bot tự mua bán theo chiến lược "RSI + xu hướng"
-  bằng giá thật, báo từng lệnh qua Telegram (📝 Lệnh giấy). Bản tin 8h sáng có thêm tổng lãi/lỗ ảo.
-  Không đụng tới tiền thật hay tài khoản sàn.
-- Nên để giao dịch giấy chạy ít nhất 1–2 tháng. Nếu kết quả không thắng được việc mua rồi giữ
-  thì chiến lược đó không đáng dùng tiền thật.
+- **Backtest (Chủ nhật 9h sáng):** thử 3 chiến lược trên 180 ngày giá gần nhất, cả khung 1h và 4h
+  (2 tin nhắn). Mỗi dòng có lãi/lỗ, số lệnh, tỉ lệ thắng, mức sụt tối đa, và "hơn mua-giữ k/3 giai đoạn":
+  180 ngày chia 3 giai đoạn 2 tháng, chiến lược thắng mua-giữ ở cả 3 mới là ổn định.
+  Chạy ngay: Actions → Run workflow → chọn `backtest`.
+- **Giao dịch giấy:** 3 chiến lược chạy song song, mỗi chiến lược 1.000 USDT ảo chia đều cho 3 coin.
+  Lệnh ảo báo qua Telegram (📝 [tên chiến lược] MUA/BÁN). Bản tin 8h sáng có bảng so sánh 3 chiến lược.
+- **Cảnh báo EMA:** chỉ báo khi EMA20 cắt EMA50 trên khung 4h (khung 1h báo quá nhiều lúc giá đi ngang).
+- Quy tắc 3 chiến lược nằm trong `strategies.py`, backtest và giao dịch giấy dùng chung.
+- Nên để giao dịch giấy chạy ít nhất 1–2 tháng trước khi tin một chiến lược nào.
 
 ## Lưu ý
 - GitHub có thể chạy trễ 5–15 phút so với lịch, nhất là giờ cao điểm.

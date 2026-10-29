@@ -1,11 +1,12 @@
 """
-Bot cảnh báo crypto - GIAI ĐOẠN 2 (chạy trên GitHub Actions).
+Bot cảnh báo crypto (chạy trên GitHub Actions).
 
-Mỗi lần chạy:
-  1. Lấy giá 1h từ Binance, tính RSI, % 24h, khối lượng, xu hướng EMA20/EMA50.
-  2. Đọc tin tức crypto mới nhất (RSS CoinDesk, Cointelegraph).
-  3. Có cảnh báo -> nhờ Claude giải thích ngắn gọn bằng tiếng Việt -> gửi Telegram.
-Chế độ MODE=digest (8h sáng): gửi bản tóm tắt thị trường cả ngày.
+Mỗi lần chạy (MODE=alert, 15 phút/lần):
+  1. Lấy giá 1h từ Binance: RSI, % 24h, khối lượng. Lấy thêm nến 4h để bắt EMA20 cắt EMA50.
+  2. Có cảnh báo -> đọc tin tức (CoinDesk, Cointelegraph) -> nhờ Claude giải thích -> Telegram.
+  3. Giao dịch giấy: 3 chiến lược chạy song song, mỗi chiến lược 1.000 USDT ảo.
+MODE=digest (8h sáng): bản tin thị trường + bảng so sánh giao dịch giấy.
+MODE=test: kiểm tra kết nối Telegram.
 
 Không có ANTHROPIC_API_KEY thì bot vẫn chạy, chỉ thiếu phần AI giải thích.
 Chỉ ĐỌC dữ liệu, KHÔNG đặt lệnh.
@@ -20,13 +21,13 @@ from email.utils import parsedate_to_datetime
 
 import requests
 
+from strategies import STRATEGIES, decide, indicators
+
 # ================== CẤU HÌNH ==================
 COINS = {  # mã sàn : các từ khóa để lọc tin
     "BTCUSDT": ["bitcoin", "btc"],
     "ETHUSDT": ["ethereum", "eth", "ether"],
     "SOLUSDT": ["solana", "sol"],
-    "BNBUSDT": ["bnb", "binance"],
-    "XRPUSDT": ["xrp", "ripple"],
 }
 INTERVAL = "1h"
 RSI_PERIOD = 14
@@ -68,8 +69,8 @@ def save_state(state):
 
 
 # ---------- Dữ liệu giá ----------
-def fetch(symbol, limit=100):
-    r = requests.get(DATA_URL, params={"symbol": symbol, "interval": INTERVAL,
+def fetch(symbol, limit=200, interval=INTERVAL):
+    r = requests.get(DATA_URL, params={"symbol": symbol, "interval": interval,
                                        "limit": limit}, timeout=20)
     r.raise_for_status()
     rows = r.json()
@@ -107,7 +108,7 @@ def ema(values, period):
 def analyze(closes, volumes):
     price = closes[-1]
     a = {"price": price, "rsi": rsi(closes), "chg": None, "volx": None,
-         "trend": None, "cross": None}
+         "trend": None, "cross4h": None}
     if len(closes) > 24:
         a["chg"] = (price - closes[-25]) / closes[-25] * 100
     if len(volumes) > 22:
@@ -115,14 +116,22 @@ def analyze(closes, volumes):
         if avg > 0:
             a["volx"] = volumes[-2] / avg
     e20, e50 = ema(closes, 20), ema(closes, 50)
-    if len(e50) >= 2:
-        # e20 và e50 cùng kết thúc ở nến mới nhất, nên so phần tử cuối là đúng
-        now_up = e20[-1] > e50[-1]
-        prev_up = e20[-2] > e50[-2]
-        a["trend"] = "tăng" if now_up else "giảm"
-        if now_up != prev_up:
-            a["cross"] = "golden" if now_up else "death"
+    if e50:
+        a["trend"] = "tăng" if e20[-1] > e50[-1] else "giảm"
     return a
+
+
+def cross_4h(closes_4h):
+    """EMA20 cắt EMA50 trên nến 4h ĐÃ ĐÓNG gần nhất. Khung 1h cắt qua cắt lại quá nhiều
+    khi giá đi ngang (backtest: 10-11 lệnh/39 ngày, thắng gần 0%), nên chỉ báo trên 4h."""
+    closed = closes_4h[:-1]
+    e20, e50 = ema(closed, 20), ema(closed, 50)
+    if len(e50) < 2:
+        return None
+    now_up, prev_up = e20[-1] > e50[-1], e20[-2] > e50[-2]
+    if now_up == prev_up:
+        return None
+    return "golden" if now_up else "death"
 
 
 def build_alerts(a):
@@ -137,10 +146,10 @@ def build_alerts(a):
         al.append((f"chg_{w}", f"{w} {a['chg']:+.1f}% trong 24h"))
     if a["volx"] is not None and a["volx"] >= VOLUME_SPIKE_X:
         al.append(("volume", f"Khối lượng gấp {a['volx']:.1f} lần bình thường"))
-    if a["cross"] == "golden":
-        al.append(("cross_golden", "EMA20 vừa cắt LÊN EMA50 - xu hướng có thể chuyển tăng"))
-    elif a["cross"] == "death":
-        al.append(("cross_death", "EMA20 vừa cắt XUỐNG EMA50 - xu hướng có thể chuyển giảm"))
+    if a["cross4h"] == "golden":
+        al.append(("cross4h_golden", "Khung 4h: EMA20 vừa cắt LÊN EMA50 - xu hướng có thể chuyển tăng"))
+    elif a["cross4h"] == "death":
+        al.append(("cross4h_death", "Khung 4h: EMA20 vừa cắt XUỐNG EMA50 - xu hướng có thể chuyển giảm"))
     return al
 
 
@@ -250,67 +259,58 @@ def send_telegram(text):
     return r.ok
 
 
-# ---------- Giao dịch giấy (giai đoạn 3b) ----------
-PAPER_START = 200.0   # USDT ảo cho mỗi coin
-PAPER_FEE = 0.001
-PAPER_STOP = 0.05
+# ---------- Giao dịch giấy: 3 chiến lược song song ----------
+PAPER_PER_STRATEGY = 1000.0   # USDT ảo cho mỗi chiến lược, chia đều cho các coin
 
 
-def paper_signal(closed):
-    """Chiến lược 'RSI + xu hướng', tính trên nến đã đóng (cùng quy tắc với backtest.py):
-    mua khi RSI <= 40 lúc EMA20 > EMA50; bán khi RSI >= 70 hoặc EMA20 < EMA50."""
-    r = rsi(closed)
-    e20, e50 = ema(closed, 20), ema(closed, 50)
-    if r is None or not e50:
-        return None
-    up = e20[-1] > e50[-1]
-    if up and r <= 40:
-        return "buy"
-    if r >= 70 or not up:
-        return "sell"
-    return None
+def paper_book(state, key, sym):
+    return state.setdefault("paper3", {}).setdefault(key, {}).setdefault(sym, {
+        "cash": PAPER_PER_STRATEGY / len(COINS), "coin": 0.0, "entry": 0.0,
+        "bar": 0, "trades": 0, "wins": 0})
 
 
 def paper_step(state, sym, a):
-    """Trả về tin nhắn nếu vừa có lệnh giấy, ngược lại None."""
-    book = state.setdefault("paper", {}).setdefault(
-        sym, {"cash": PAPER_START, "coin": 0.0, "entry": 0.0, "bar": 0, "trades": 0, "wins": 0})
-    if a["bar"] <= book["bar"]:
-        return None  # nến này đã xét rồi
-    book["bar"] = a["bar"]
-    price = a["closed"][-1]
-    sig = paper_signal(a["closed"])
-    reason = "tín hiệu RSI + xu hướng"
-    if book["coin"] > 0 and price <= book["entry"] * (1 - PAPER_STOP):
-        sig, reason = "sell", "cắt lỗ 5%"
-    if sig == "buy" and book["coin"] == 0:
-        book["coin"] = book["cash"] * (1 - PAPER_FEE) / price
-        book["cash"], book["entry"] = 0.0, price
-        return f"📝 Lệnh giấy: MUA {sym} giá {price:,.4f} ({reason})"
-    if sig == "sell" and book["coin"] > 0:
-        pnl = price / book["entry"] - 1
-        book["cash"], book["coin"] = book["coin"] * price * (1 - PAPER_FEE), 0.0
-        book["trades"] += 1
-        book["wins"] += pnl > 0
-        return (f"📝 Lệnh giấy: BÁN {sym} giá {price:,.4f} ({reason})\n"
-                f"Lãi/lỗ lệnh này: {pnl * 100:+.1f}% | Vốn ảo coin này: {book['cash']:,.2f} USDT")
-    return None
+    """Cho cả 3 chiến lược xét nến 1h vừa đóng. Trả về danh sách tin nhắn lệnh mới."""
+    closed = a["closed"]
+    ind = indicators(closed)
+    i, price = len(closed) - 1, closed[-1]
+    msgs = []
+    for key, (name, fn) in STRATEGIES.items():
+        book = paper_book(state, key, sym)
+        if a["bar"] <= book["bar"]:
+            continue  # nến này chiến lược đã xét rồi
+        book["bar"] = a["bar"]
+        action, reason, pnl = decide(book, price, fn(i, closed, ind))
+        coin = sym.replace("USDT", "")
+        if action == "buy":
+            msgs.append(f"📝 [{name}] MUA {coin} giá {price:,.4f} ({reason})")
+        elif action == "sell":
+            book["trades"] += 1
+            book["wins"] += pnl > 0
+            msgs.append(f"📝 [{name}] BÁN {coin} giá {price:,.4f} ({reason}) | "
+                        f"lệnh này {pnl * 100:+.1f}%")
+    return msgs
 
 
 def paper_summary(state, data):
-    books = state.get("paper", {})
-    if not books:
+    strats = state.get("paper3", {})
+    if not strats:
         return ""
-    total, lines = 0.0, []
-    for sym, b in books.items():
-        price = data.get(sym, {}).get("price", b["entry"])
-        value = b["cash"] + b["coin"] * price
-        total += value
-        pos = "đang giữ" if b["coin"] > 0 else "đang cầm tiền"
-        lines.append(f"{sym.replace('USDT', ''):<4} {value:,.2f} USDT ({pos}, {b['trades']} lệnh)")
-    start = PAPER_START * len(books)
-    return (f"📝 Giao dịch giấy: {total:,.2f} / {start:,.0f} USDT ({(total / start - 1) * 100:+.1f}%)\n"
-            + "\n".join(lines))
+    lines = ["📝 Giao dịch giấy (mỗi chiến lược 1.000 USDT ảo):"]
+    for key, books in strats.items():
+        if key not in STRATEGIES:
+            continue
+        total = trades = wins = 0
+        for sym, b in books.items():
+            price = data.get(sym, {}).get("price") or b["entry"]
+            total += b["cash"] + b["coin"] * price
+            trades += b["trades"]
+            wins += b["wins"]
+        start = PAPER_PER_STRATEGY / len(COINS) * len(books)
+        win = f", thắng {wins / trades * 100:.0f}%" if trades else ""
+        lines.append(f"- {STRATEGIES[key][0]}: {total:,.0f} USDT "
+                     f"({(total / start - 1) * 100:+.1f}%, {trades} lệnh{win})")
+    return "\n".join(lines)
 
 
 # ---------- Hai chế độ chạy ----------
@@ -326,6 +326,10 @@ def collect():
         a = analyze(closes, vols)
         a["closed"] = closes[:-1]   # chỉ các nến đã đóng, dùng cho giao dịch giấy
         a["bar"] = times[-2]        # thời điểm mở của nến đã đóng gần nhất
+        try:
+            a["cross4h"] = cross_4h(fetch(sym, limit=100, interval="4h")[0])
+        except requests.RequestException as e:
+            print(f"Lỗi lấy nến 4h {sym}: {e}")
         data[sym] = a
         chg = f"{a['chg']:+.1f}%" if a["chg"] is not None else "?"
         print(f"{sym:<9} {a['price']:>12,.4f}  24h {chg:>7}  RSI {a['rsi'] or 0:.0f}  xu hướng {a['trend']}")
@@ -339,10 +343,10 @@ def run_alerts():
     now = int(time.time())
     data = collect()
     news = None  # chỉ đọc tin khi thật sự có cảnh báo
+    trades = [m for sym, a in data.items() for m in paper_step(state, sym, a)]
+    if trades:  # gộp mọi lệnh giấy của lượt này vào 1 tin
+        send_telegram("\n".join(trades) + "\n\n(Lệnh ẢO để đo chiến lược, không phải lệnh thật)")
     for sym, a in data.items():
-        trade_msg = paper_step(state, sym, a)
-        if trade_msg:
-            send_telegram(trade_msg + f"\n\n{DISCLAIMER}")
         sent = state.setdefault(sym, {})
         fresh = [(k, m) for k, m in build_alerts(a) if now - sent.get(k, 0) >= COOLDOWN_SEC]
         if not fresh:
