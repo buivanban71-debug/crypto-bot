@@ -1,0 +1,58 @@
+name: Canh bao crypto
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # cảnh báo: 15 phút/lần
+    - cron: "0 1 * * *"      # bản tin: 01:00 UTC = 8:00 sáng giờ Việt Nam
+    - cron: "0 2 * * 0"      # backtest: Chủ nhật 9:00 sáng giờ Việt Nam
+  workflow_dispatch:          # bấm chạy tay để thử
+    inputs:
+      mode:
+        description: "alert = cảnh báo, digest = bản tin, backtest = thử chiến lược"
+        type: choice
+        options: [alert, digest, backtest]
+        default: alert
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crypto-alert
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cai thu vien
+        run: pip install requests
+
+      - name: Lay trang thai lan truoc
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - name: Chay bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MODE: ${{ github.event.schedule == '0 1 * * *' && 'digest' || github.event.schedule == '0 2 * * 0' && 'backtest' || inputs.mode || 'alert' }}
+        run: |
+          if [ "$MODE" = "backtest" ]; then python backtest.py; else python bot_actions.py; fi
+
+      - name: Luu trang thai
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
