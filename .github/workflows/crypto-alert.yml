@@ -8,10 +8,10 @@ on:
   workflow_dispatch:          # bấm chạy tay để thử
     inputs:
       mode:
-        description: "alert = cảnh báo, digest = bản tin, backtest = thử chiến lược"
+        description: "test = kiểm tra Telegram, alert = cảnh báo, digest = bản tin, backtest = thử chiến lược"
         type: choice
-        options: [alert, digest, backtest]
-        default: alert
+        options: [test, alert, digest, backtest]
+        default: test
 
 permissions:
   contents: read
